@@ -1,0 +1,465 @@
+#!/usr/bin/env node
+// Checks every plugin and catalog in this repository against the Agent Plugins
+// schemas in schemas/agent-plugins/ and against the Claude Code plugin and
+// marketplace structure. Node.js 20 or newer, no dependencies.
+//
+//   scripts/validate            check everything; warnings do not fail
+//   scripts/validate --strict   fail on warnings too
+
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const ROOT = path.resolve(__dirname, '..');
+const STRICT = process.argv.includes('--strict');
+const SCHEMA_VERSIONS = ['1.0.0', '1.1.0'];
+const PLUGIN_SCHEMA = (v) => `https://agent-plugins.org/schemas/${v}/plugin.schema.json`;
+const MCP_SCHEMA = (v) => `https://agent-plugins.org/schemas/${v}/mcp.schema.json`;
+/** Agent Skills frontmatter fields. */
+const SKILL_FIELDS = ['name', 'description', 'license', 'compatibility', 'metadata', 'allowed-tools'];
+/** Fields some clients add to SKILL.md; the reference validator reports them as unexpected. */
+const CLIENT_SKILL_FIELDS = ['argument-hint', 'disable-model-invocation', 'user-invocable', 'model'];
+/** Claude Code hook events. */
+const HOOK_EVENTS = [
+  'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Notification', 'UserPromptSubmit', 'Stop',
+  'SubagentStart', 'SubagentStop', 'PreCompact', 'SessionStart', 'SessionEnd', 'PermissionRequest',
+];
+/** Claude Code manifest fields that name files inside the plugin. */
+const CLAUDE_PATH_FIELDS = ['skills', 'commands', 'agents', 'hooks', 'mcpServers', 'outputStyles', 'lspServers'];
+
+const errors = [];
+const warnings = [];
+const error = (where, message) => errors.push(`${where}: ${message}`);
+const warn = (where, message) => warnings.push(`${where}: ${message}`);
+const rel = (p) => path.relative(ROOT, p) || '.';
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    error(rel(file), err.code === 'ENOENT' ? 'missing' : `not valid JSON (${err.message})`);
+    return undefined;
+  }
+}
+
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** The real path of `target` if it exists inside `base`. */
+function inside(base, target) {
+  try {
+    const real = fs.realpathSync(target);
+    const realBase = fs.realpathSync(base);
+    return real === realBase || real.startsWith(realBase + path.sep) ? real : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// JSON Schema, the 2020-12 keywords the Agent Plugins schemas use.
+
+const schemaCache = new Map();
+function schema(kind, version) {
+  const file = path.join(ROOT, 'schemas', 'agent-plugins', version, `${kind}.schema.json`);
+  if (!schemaCache.has(file)) schemaCache.set(file, JSON.parse(fs.readFileSync(file, 'utf8')));
+  return schemaCache.get(file);
+}
+
+function typeMatches(type, value) {
+  switch (type) {
+    case 'object': return isObject(value);
+    case 'array': return Array.isArray(value);
+    case 'string': return typeof value === 'string';
+    case 'boolean': return typeof value === 'boolean';
+    case 'number': return typeof value === 'number';
+    case 'integer': return Number.isInteger(value);
+    case 'null': return value === null;
+    default: return false;
+  }
+}
+
+function check(node, value, at, root, out) {
+  if (node === true) return;
+  if (node === false) return void out.push(`${at}: not allowed`);
+  if (node.$ref) {
+    const name = node.$ref.replace('#/$defs/', '');
+    check(root.$defs[name], value, at, root, out);
+  }
+  if ('const' in node && JSON.stringify(value) !== JSON.stringify(node.const)) {
+    out.push(`${at}: must be ${JSON.stringify(node.const)}`);
+  }
+  if (node.enum && !node.enum.some((e) => JSON.stringify(e) === JSON.stringify(value))) {
+    out.push(`${at}: must be one of ${node.enum.join(', ')}`);
+  }
+  if (node.type) {
+    const types = [].concat(node.type);
+    if (!types.some((t) => typeMatches(t, value))) return void out.push(`${at}: must be ${types.join(' or ')}`);
+  }
+  if (typeof value === 'string') {
+    const length = [...value].length;
+    if (node.minLength !== undefined && length < node.minLength) out.push(`${at}: shorter than ${node.minLength}`);
+    if (node.maxLength !== undefined && length > node.maxLength) out.push(`${at}: longer than ${node.maxLength}`);
+    if (node.pattern && !new RegExp(node.pattern, 'u').test(value)) out.push(`${at}: does not match ${node.pattern}`);
+  }
+  if (Array.isArray(value) && node.items) value.forEach((v, i) => check(node.items, v, `${at}[${i}]`, root, out));
+  if (isObject(value)) {
+    for (const key of node.required || []) if (!(key in value)) out.push(`${at}: missing ${key}`);
+    for (const [key, v] of Object.entries(value)) {
+      if (node.propertyNames) check(node.propertyNames, key, `${at} key ${JSON.stringify(key)}`, root, out);
+      if (node.properties && key in node.properties) check(node.properties[key], v, `${at}.${key}`, root, out);
+      else if (node.additionalProperties === false) out.push(`${at}.${key}: not allowed`);
+      else if (isObject(node.additionalProperties)) check(node.additionalProperties, v, `${at}.${key}`, root, out);
+    }
+  }
+  if (node.oneOf) {
+    const results = node.oneOf.map((s) => {
+      const o = [];
+      check(s, value, at, root, o);
+      return o;
+    });
+    const passing = results.filter((r) => r.length === 0).length;
+    if (passing === 0) {
+      const closest = results.reduce((a, b) => (b.length < a.length ? b : a));
+      out.push(`${at}: matches none of its allowed forms (closest: ${closest.join('; ')})`);
+    } else if (passing > 1) out.push(`${at}: matches more than one of its forms`);
+  }
+  if (node.not) {
+    const o = [];
+    check(node.not, value, at, root, o);
+    if (o.length === 0) out.push(`${at}: not allowed`);
+  }
+}
+
+function validateAgainst(kind, version, value, where) {
+  const root = schema(kind, version);
+  const out = [];
+  check(root, value, kind === 'plugin' ? 'plugin.json' : 'mcp.json', root, out);
+  for (const message of out) error(where, message);
+}
+
+// Markdown frontmatter: the YAML subset skills, commands and agents use.
+
+function frontmatter(text) {
+  const match = /^﻿?---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
+  if (!match) return undefined;
+  const fields = {};
+  const lines = match[1].split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
+    if (!m) continue;
+    const [, key, rest] = m;
+    const nested = [];
+    while (i + 1 < lines.length && /^(\s|$)/.test(lines[i + 1])) nested.push(lines[++i]);
+    if (/^[>|]/.test(rest)) {
+      const folded = rest.startsWith('>');
+      const text = nested.map((l) => l.trim()).join(folded ? ' ' : '\n').trim();
+      fields[key] = text;
+    } else if (rest === '' && nested.some((l) => /^\s*-\s/.test(l))) {
+      fields[key] = nested.filter((l) => /^\s*-\s/.test(l)).map((l) => l.replace(/^\s*-\s+/, '').trim());
+    } else if (rest === '') {
+      fields[key] = Object.fromEntries(
+        nested.filter((l) => l.includes(':')).map((l) => l.trim().split(/:\s*/, 2)),
+      );
+    } else {
+      fields[key] = rest.replace(/^(["'])(.*)\1$/, '$2');
+    }
+  }
+  return fields;
+}
+
+// Plugins.
+
+function validatePlugin(dir) {
+  const where = rel(dir);
+  const manifest = readJson(path.join(dir, 'plugin.json'));
+  let version;
+  if (isObject(manifest)) {
+    version = SCHEMA_VERSIONS.find((v) => manifest.$schema === PLUGIN_SCHEMA(v));
+    if (!version) error(`${where}/plugin.json`, `$schema must be one of ${SCHEMA_VERSIONS.map(PLUGIN_SCHEMA).join(', ')}`);
+    else validateAgainst('plugin', version, manifest, `${where}/plugin.json`);
+    if (typeof manifest.name === 'string' && manifest.name !== path.basename(dir)) {
+      warn(`${where}/plugin.json`, `name "${manifest.name}" differs from its folder`);
+    }
+  }
+
+  const claude = readJson(path.join(dir, '.claude-plugin', 'plugin.json'));
+  if (isObject(claude)) {
+    const at = `${where}/.claude-plugin/plugin.json`;
+    if (typeof claude.name !== 'string' || !/^[a-z0-9][a-z0-9.-]*$/.test(claude.name)) {
+      error(at, 'name must be kebab-case');
+    }
+    if (isObject(manifest)) {
+      for (const key of ['name', 'version', 'description', 'license']) {
+        if (manifest[key] !== claude[key]) error(at, `${key} differs from plugin.json`);
+      }
+    }
+    for (const field of CLAUDE_PATH_FIELDS) {
+      if (!(field in claude)) continue;
+      const paths = [].concat(claude[field]).filter((p) => typeof p === 'string');
+      for (const p of paths) {
+        if (!p.startsWith('./')) error(at, `${field}: "${p}" must start with ./`);
+        else if (!inside(dir, path.join(dir, p))) error(at, `${field}: "${p}" is missing or outside the plugin`);
+      }
+    }
+  }
+
+  validateMcp(dir, version);
+  validateSkills(dir);
+  for (const file of markdownFiles(path.join(dir, 'commands'))) {
+    const front = frontmatter(fs.readFileSync(file, 'utf8'));
+    if (!front?.description) warn(rel(file), 'no description in its frontmatter');
+  }
+  for (const file of markdownFiles(path.join(dir, 'agents'))) {
+    const front = frontmatter(fs.readFileSync(file, 'utf8'));
+    if (!front?.name || !front?.description) error(rel(file), 'an agent needs name and description frontmatter');
+  }
+  validateHooks(dir);
+  validateContainment(dir, dir);
+}
+
+function validateMcp(dir, version) {
+  const portable = path.join(dir, 'mcp.json');
+  const claude = path.join(dir, '.mcp.json');
+  const hasPortable = fs.existsSync(portable);
+  const hasClaude = fs.existsSync(claude);
+  if (hasPortable !== hasClaude) {
+    warn(rel(dir), 'ship both mcp.json (Agent Plugins) and .mcp.json (Claude Code), or neither');
+  }
+  if (hasPortable) {
+    const config = readJson(portable);
+    if (isObject(config)) {
+      if (version && config.$schema !== MCP_SCHEMA(version)) {
+        error(rel(portable), `$schema must be ${MCP_SCHEMA(version)}, the version plugin.json targets`);
+      } else if (version) {
+        validateAgainst('mcp', version, config, rel(portable));
+      }
+      for (const [name, server] of Object.entries(config.mcpServers || {})) {
+        const at = `${rel(portable)} server ${name}`;
+        if (server.type === 'stdio') {
+          if (server.command?.startsWith('./') && !inside(dir, path.join(dir, server.command))) {
+            error(at, 'command is missing or outside the plugin');
+          } else if (/[\\/]/.test(server.command || '') && !server.command.startsWith('./')) {
+            error(at, 'command must be a bare name or start with ./');
+          }
+          if (server.cwd?.startsWith('./') && !inside(dir, path.join(dir, server.cwd))) {
+            error(at, 'cwd is missing or outside the plugin');
+          }
+        } else if (server.url) {
+          const url = new URL(server.url);
+          const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+          if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
+            error(at, 'url must use https (http only for loopback)');
+          }
+        }
+      }
+    }
+  }
+  if (hasClaude) {
+    const config = readJson(claude);
+    const servers = isObject(config) && isObject(config.mcpServers) ? config.mcpServers : undefined;
+    if (!servers) error(rel(claude), 'must hold an mcpServers object');
+    for (const [name, server] of Object.entries(servers || {})) {
+      if (!server.command && !server.url) error(rel(claude), `server ${name} needs command or url`);
+    }
+  }
+}
+
+function validateSkills(dir) {
+  const skills = path.join(dir, 'skills');
+  if (!fs.existsSync(skills)) return;
+  for (const entry of fs.readdirSync(skills, { withFileTypes: true })) {
+    const skillDir = path.join(skills, entry.name);
+    if (!entry.isDirectory()) {
+      warn(rel(skillDir), 'only skill folders belong in skills/');
+      continue;
+    }
+    const file = path.join(skillDir, 'SKILL.md');
+    if (!fs.existsSync(file)) {
+      error(rel(skillDir), 'no SKILL.md');
+      continue;
+    }
+    const where = rel(file);
+    const front = frontmatter(fs.readFileSync(file, 'utf8'));
+    if (!front) {
+      error(where, 'no frontmatter');
+      continue;
+    }
+    const name = front.name;
+    if (typeof name !== 'string' || !name) error(where, 'name is required');
+    else {
+      if (name.length > 64) error(where, 'name is longer than 64 characters');
+      if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name)) error(where, `name "${name}" must be lowercase letters, digits and single hyphens`);
+      if (name !== entry.name) error(where, `name "${name}" must match its folder "${entry.name}"`);
+    }
+    if (typeof front.description !== 'string' || !front.description.trim()) error(where, 'description is required');
+    else if (front.description.length > 1024) error(where, 'description is longer than 1024 characters');
+    if (typeof front.compatibility === 'string' && front.compatibility.length > 500) {
+      error(where, 'compatibility is longer than 500 characters');
+    }
+    if ('metadata' in front && !isObject(front.metadata)) error(where, 'metadata must be a map of strings');
+    for (const key of Object.keys(front)) {
+      if (SKILL_FIELDS.includes(key)) continue;
+      if (CLIENT_SKILL_FIELDS.includes(key)) {
+        warn(where, `"${key}" is a client extension (Claude Code, VS Code, malac); strict Agent Skills validators report it`);
+      } else {
+        error(where, `"${key}" is not an Agent Skills field`);
+      }
+    }
+    const scripts = path.join(skillDir, 'scripts');
+    for (const script of fs.existsSync(scripts) ? fs.readdirSync(scripts) : []) {
+      const full = path.join(scripts, script);
+      if (fs.statSync(full).isFile() && !(fs.statSync(full).mode & 0o111)) warn(rel(full), 'not executable');
+    }
+  }
+}
+
+function validateHooks(dir) {
+  const file = path.join(dir, 'hooks', 'hooks.json');
+  if (!fs.existsSync(file)) return;
+  const config = readJson(file);
+  const where = rel(file);
+  if (!isObject(config) || !isObject(config.hooks)) return void error(where, 'must hold a "hooks" object of events');
+  for (const [event, groups] of Object.entries(config.hooks)) {
+    if (!HOOK_EVENTS.includes(event)) error(where, `unknown event ${event}`);
+    for (const group of Array.isArray(groups) ? groups : []) {
+      for (const hook of group.hooks || []) {
+        if (hook.type === 'command' && typeof hook.command !== 'string') error(where, `${event}: a command hook needs command`);
+        for (const [, ref] of (hook.command || '').matchAll(/\$\{CLAUDE_PLUGIN_ROOT\}\/([^"'\s]+)/g)) {
+          if (!inside(dir, path.join(dir, ref))) error(where, `${event}: ${ref} is missing or outside the plugin`);
+        }
+      }
+    }
+    if (!Array.isArray(groups)) error(where, `${event} must be an array`);
+  }
+}
+
+/** Symlinks must stay inside the plugin. */
+function validateContainment(root, dir) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isSymbolicLink() && !inside(root, full)) error(rel(full), 'symlink leaves the plugin');
+    else if (entry.isDirectory()) validateContainment(root, full);
+  }
+}
+
+function markdownFiles(dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir, { withFileTypes: true, recursive: true })
+    .filter((e) => e.isFile() && e.name.endsWith('.md'))
+    .map((e) => path.join(e.parentPath ?? e.path, e.name));
+}
+
+// Catalogs.
+
+/** Checks a Claude Code-shaped catalog; returns its local plugin names and all names. */
+function validateClaudeCatalog(file, { requireOwner }) {
+  const catalog = readJson(file);
+  const where = rel(file);
+  const local = [];
+  const all = [];
+  if (!isObject(catalog)) return { local, all };
+  if (typeof catalog.name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(catalog.name) || catalog.name.includes('..')) {
+    error(where, 'name must be letters, digits, ".", "_" and "-", starting with a letter or digit');
+  }
+  if (requireOwner && !catalog.owner?.name) error(where, 'owner.name is required');
+  if (!Array.isArray(catalog.plugins)) {
+    error(where, 'plugins must be an array');
+    return { local, all };
+  }
+  catalog.plugins.forEach((entry, i) => {
+    const at = `${where} plugins[${i}]`;
+    if (typeof entry.name !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/.test(entry.name)) error(at, 'name must be kebab-case');
+    if (all.includes(entry.name)) error(at, `duplicate name ${entry.name}`);
+    all.push(entry.name);
+    if (typeof entry.source === 'string') {
+      if (!entry.source.startsWith('./') || entry.source.split('/').includes('..')) {
+        return void error(at, `source "${entry.source}" must be a ./ path inside the repository`);
+      }
+      const dir = inside(ROOT, path.join(ROOT, entry.source));
+      if (!dir) return void error(at, `source ${entry.source} not found`);
+      const manifest = readJson(path.join(dir, 'plugin.json'));
+      if (isObject(manifest) && manifest.name !== entry.name) error(at, `name differs from ${entry.source}/plugin.json`);
+      if ('version' in entry) warn(at, 'version belongs in the plugin\'s manifests, which take precedence');
+      local.push(entry.name);
+    } else if (isObject(entry.source)) {
+      const { source } = entry.source;
+      if (source === 'github' && !/^[\w.-]+\/[\w.-]+$/.test(entry.source.repo || '')) error(at, 'a github source needs repo: owner/name');
+      else if (['url', 'git-subdir'].includes(source) && typeof entry.source.url !== 'string') error(at, `a ${source} source needs url`);
+      else if (!['github', 'url', 'git-subdir', 'npm'].includes(source)) error(at, `unknown source type ${source}`);
+    } else {
+      error(at, 'source is required');
+    }
+  });
+  return { local, all };
+}
+
+function validateCodexCatalog(file) {
+  const catalog = readJson(file);
+  const where = rel(file);
+  const local = [];
+  const all = [];
+  if (!isObject(catalog) || !Array.isArray(catalog.plugins)) {
+    error(where, 'needs a name and a plugins array');
+    return { local, all };
+  }
+  if (typeof catalog.name !== 'string' || !catalog.name) error(where, 'name is required');
+  catalog.plugins.forEach((entry, i) => {
+    const at = `${where} plugins[${i}]`;
+    all.push(entry.name);
+    const source = entry.source || {};
+    if (source.source === 'local') {
+      if (!source.path?.startsWith('./')) return void error(at, 'source.path must start with ./');
+      const dir = inside(ROOT, path.join(ROOT, source.path));
+      if (!dir) return void error(at, `source.path ${source.path} not found`);
+      const manifest = readJson(path.join(dir, 'plugin.json'));
+      if (isObject(manifest) && manifest.name !== entry.name) error(at, `name differs from ${source.path}/plugin.json`);
+      local.push(entry.name);
+    } else if (source.source === 'url') {
+      if (typeof source.url !== 'string') error(at, 'a url source needs url');
+    } else {
+      error(at, 'source.source must be local or url');
+    }
+    if (!isObject(entry.policy)) warn(at, 'Codex expects a policy');
+  });
+  return { local, all };
+}
+
+function sameSet(a, b) {
+  return a.length === b.length && a.every((x) => b.includes(x));
+}
+
+function main() {
+  const pluginsDir = path.join(ROOT, 'plugins');
+  const dirs = fs
+    .readdirSync(pluginsDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .sort();
+  for (const name of dirs) validatePlugin(path.join(pluginsDir, name));
+
+  const claude = validateClaudeCatalog(path.join(ROOT, '.claude-plugin', 'marketplace.json'), { requireOwner: true });
+  for (const name of dirs) {
+    if (!claude.local.includes(name)) error('.claude-plugin/marketplace.json', `plugins/${name} is not listed`);
+  }
+  const cursor = validateClaudeCatalog(path.join(ROOT, '.cursor-plugin', 'marketplace.json'), { requireOwner: false });
+  if (!sameSet(cursor.local, claude.local)) {
+    error('.cursor-plugin/marketplace.json', 'must list the same plugins from plugins/ as .claude-plugin/marketplace.json');
+  }
+  const codex = validateCodexCatalog(path.join(ROOT, '.agents', 'plugins', 'marketplace.json'));
+  if (!sameSet(codex.all, claude.all)) {
+    error('.agents/plugins/marketplace.json', 'must list the same plugins as .claude-plugin/marketplace.json');
+  }
+
+  for (const w of warnings) console.log(`warning: ${w}`);
+  for (const e of errors) console.log(`error: ${e}`);
+  const failed = errors.length > 0 || (STRICT && warnings.length > 0);
+  console.log(
+    `${failed ? 'FAILED' : 'OK'}: ${dirs.length} plugins, ${claude.all.length} catalog entries, ` +
+      `${errors.length} errors, ${warnings.length} warnings`,
+  );
+  process.exit(failed ? 1 : 0);
+}
+
+main();

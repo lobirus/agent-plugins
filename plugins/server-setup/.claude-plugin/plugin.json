@@ -1,0 +1,14 @@
+{
+  "name": "server-setup",
+  "displayName": "Server Setup",
+  "version": "0.2.0",
+  "description": "Bootstrap a fresh Ubuntu/Debian server: sudo user, key-only SSH on a custom port, ufw, UTC + NTP, /data disk, Docker, and a Git deploy key",
+  "author": {
+    "name": "Bálint Horváth",
+    "url": "https://github.com/lobirus"
+  },
+  "homepage": "https://github.com/lobirus/agent-plugins/tree/main/plugins/server-setup",
+  "repository": "https://github.com/lobirus/agent-plugins",
+  "license": "MIT",
+  "keywords": ["server", "ssh", "ufw", "docker", "provisioning"]
+}

@@ -1,0 +1,36 @@
+{
+  "name": "lobirus",
+  "description": "Provider-agnostic agent plugins by lobirus: each one is an Agent Plugins package and a Claude Code plugin",
+  "owner": {
+    "name": "Bálint Horváth",
+    "url": "https://github.com/lobirus"
+  },
+  "plugins": [
+    {
+      "name": "server-setup",
+      "source": "./plugins/server-setup",
+      "description": "Bootstrap a fresh Ubuntu/Debian server: sudo user, key-only SSH on a custom port, ufw, UTC + NTP, /data disk, Docker, and a Git deploy key",
+      "category": "devops",
+      "tags": ["server", "ssh", "ufw", "docker", "provisioning"]
+    },
+    {
+      "name": "release-tools",
+      "source": "./plugins/release-tools",
+      "description": "Changelog entries from the commits since the last tag, release notes, a release check, and a guard against force pushes",
+      "category": "release",
+      "tags": ["release", "changelog", "git"]
+    },
+    {
+      "name": "ponytail",
+      "source": {
+        "source": "github",
+        "repo": "DietrichGebert/ponytail"
+      },
+      "description": "Lazy senior dev mode: the smallest change that fully solves the task, plus reviews and audits for bugs, risk and bloat. By Dietrich Gebert, from its own repository.",
+      "homepage": "https://ponytail.dev",
+      "license": "MIT",
+      "category": "productivity",
+      "tags": ["yagni", "minimalism", "code-review"]
+    }
+  ]
+}

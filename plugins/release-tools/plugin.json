@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "release-tools",
+  "version": "1.0.0",
+  "description": "Changelog entries from the commits since the last tag, release notes, a release check, and a guard against force pushes",
+  "author": {
+    "name": "Bálint Horváth",
+    "url": "https://github.com/lobirus"
+  },
+  "homepage": "https://github.com/lobirus/agent-plugins/tree/main/plugins/release-tools",
+  "repository": "https://github.com/lobirus/agent-plugins",
+  "license": "MIT",
+  "keywords": ["release", "changelog", "git"]
+}

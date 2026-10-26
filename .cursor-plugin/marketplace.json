@@ -1,0 +1,22 @@
+{
+  "name": "lobirus",
+  "owner": {
+    "name": "Bálint Horváth",
+    "url": "https://github.com/lobirus"
+  },
+  "metadata": {
+    "description": "Provider-agnostic agent plugins by lobirus"
+  },
+  "plugins": [
+    {
+      "name": "server-setup",
+      "source": "./plugins/server-setup",
+      "description": "Bootstrap a fresh Ubuntu/Debian server: sudo user, key-only SSH on a custom port, ufw, UTC + NTP, /data disk, Docker, and a Git deploy key"
+    },
+    {
+      "name": "release-tools",
+      "source": "./plugins/release-tools",
+      "description": "Changelog entries from the commits since the last tag, release notes, a release check, and a guard against force pushes"
+    }
+  ]
+}
